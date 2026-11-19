@@ -27,7 +27,7 @@ class _NeuralOverlayAppState extends State<NeuralOverlayApp> {
   void initState() {
     super.initState();
 
-    // Listen to real-time voice amplitude and state stream from the detector
+    // Listen to real-time events (mic amplitude, state, etc.)
     FlutterOverlayWindow.overlayListener.listen((data) {
       if (data == null) return;
       final msg = data.toString();
@@ -138,6 +138,14 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
         }
       },
     );
+
+    // Listen for close signal from native Android when dragged all the way down
+    FlutterOverlayWindow.overlayListener.listen((data) async {
+      if (data == 'close') {
+        await _voiceService.stopListening();
+      }
+    });
+
     _checkAndExecute();
   }
 
@@ -165,14 +173,19 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
       return;
     }
 
-    // 1. Show the floating overlay with touch pass-through enabled
+    // 1. Show floating overlay window
+    // enableDrag: true enables native touch drag in Android WindowManager.
+    // flag: defaultFlag (FLAG_NOT_FOCUSABLE) allows all touches outside the
+    // 200x200 window to pass straight through to background apps.
     await FlutterOverlayWindow.showOverlay(
       enableDrag: true,
       overlayTitle: 'Neuro Assistant',
       overlayContent: 'Neural Voice Assistant Active',
-      flag: OverlayFlag.clickThrough, // All touches pass through to backscreen apps
+      flag: OverlayFlag.defaultFlag,
+      alignment: OverlayAlignment.topLeft,
+      startPosition: const OverlayPosition(20, 150),
       visibility: NotificationVisibility.visibilityPublic,
-      positionGravity: PositionGravity.auto,
+      positionGravity: PositionGravity.none,
       height: 200,
       width: 200,
     );
@@ -180,7 +193,7 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
     // 2. Start continuous voice detection
     await _voiceService.startListening();
 
-    // 3. Immediately minimize app so no full screen or app view is shown
+    // 3. Immediately minimize app so no full-screen window is ever visible
     await _minimizeApp();
   }
 
@@ -200,7 +213,6 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
     }
 
     final micGranted = await _voiceService.hasPermission(request: true);
-
     final hasOverlay = await FlutterOverlayWindow.isPermissionGranted();
 
     if (hasOverlay && micGranted) {
@@ -219,7 +231,6 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
 
   @override
   Widget build(BuildContext context) {
-    // If permissions are already granted, keep UI completely transparent while it minimizes
     if (!_needsPermissions) {
       return const Scaffold(
         backgroundColor: Colors.transparent,
@@ -227,7 +238,6 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
       );
     }
 
-    // If first-time permissions are needed, show a minimal floating translucent prompt
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Center(
@@ -275,7 +285,8 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
               GestureDetector(
                 onTap: _requestPermissionsAndStart,
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(30),
                     gradient: const LinearGradient(
