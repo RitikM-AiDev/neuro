@@ -1,8 +1,10 @@
 package flutter.overlay.window.flutter_overlay_window;
 
+import android.animation.ValueAnimator;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -10,19 +12,24 @@ import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
-import android.app.PendingIntent;
 import android.graphics.Point;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
+import android.view.animation.OvershootInterpolator;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
@@ -30,8 +37,6 @@ import androidx.core.app.NotificationCompat;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Timer;
-import java.util.TimerTask;
 
 import io.flutter.embedding.android.FlutterTextureView;
 import io.flutter.embedding.android.FlutterView;
@@ -44,6 +49,7 @@ import io.flutter.plugin.common.MethodChannel;
 public class OverlayService extends Service implements View.OnTouchListener {
     private final int DEFAULT_NAV_BAR_HEIGHT_DP = 48;
     private final int DEFAULT_STATUS_BAR_HEIGHT_DP = 25;
+    private static final int LONG_PRESS_TIMEOUT_MS = 320;
 
     private Integer mStatusBarHeight = -1;
     private Integer mNavigationBarHeight = -1;
@@ -55,19 +61,54 @@ public class OverlayService extends Service implements View.OnTouchListener {
     public static boolean isRunning = false;
     private WindowManager windowManager = null;
     private FlutterView flutterView;
-    private MethodChannel flutterChannel = new MethodChannel(FlutterEngineCache.getInstance().get(OverlayConstants.CACHED_TAG).getDartExecutor(), OverlayConstants.OVERLAY_TAG);
-    private BasicMessageChannel<Object> overlayMessageChannel = new BasicMessageChannel(FlutterEngineCache.getInstance().get(OverlayConstants.CACHED_TAG).getDartExecutor(), OverlayConstants.MESSENGER_TAG, JSONMessageCodec.INSTANCE);
+    private MethodChannel flutterChannel = new MethodChannel(
+            FlutterEngineCache.getInstance().get(OverlayConstants.CACHED_TAG).getDartExecutor(),
+            OverlayConstants.OVERLAY_TAG
+    );
+    private BasicMessageChannel<Object> overlayMessageChannel = new BasicMessageChannel<>(
+            FlutterEngineCache.getInstance().get(OverlayConstants.CACHED_TAG).getDartExecutor(),
+            OverlayConstants.MESSENGER_TAG,
+            JSONMessageCodec.INSTANCE
+    );
     private int clickableFlag = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
 
-    private Handler mAnimationHandler = new Handler();
-    private float lastX, lastY;
-    private int lastYPosition;
-    private boolean dragging;
-    private static final float MAXIMUM_OPACITY_ALLOWED_FOR_S_AND_HIGHER = 0.8f;
     private Point szWindow = new Point();
-    private Timer mTrayAnimationTimer;
-    private TrayAnimationTimerTask mTrayTimerTask;
+    private WindowManager.LayoutParams bubbleParams;
+    private DismissTargetView dismissTargetView;
+    private WindowManager.LayoutParams dismissParams;
+
+    private final Handler mHandler = new Handler();
+    private boolean isLongPressed = false;
+    private boolean isDragging = false;
+    private boolean isHoveringDismiss = false;
+    private float initialTouchRawX, initialTouchRawY;
+    private int initialParamsX, initialParamsY;
+    private ValueAnimator snapAnimator;
+
+    private final Runnable mLongPressRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning || flutterView == null) return;
+            isLongPressed = true;
+            isDragging = true;
+            triggerHapticFeedback();
+
+            // Bubble lift animation
+            flutterView.animate().scaleX(1.08f).scaleY(1.08f).setDuration(160).start();
+
+            // Cancel any pending tap/long-press gestures in Flutter
+            long now = SystemClock.uptimeMillis();
+            MotionEvent cancelEvent = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0, 0, 0);
+            flutterView.onTouchEvent(cancelEvent);
+            cancelEvent.recycle();
+
+            // Display circular Close (X) drop target at bottom-center
+            if (dismissTargetView != null) {
+                dismissTargetView.show();
+            }
+        }
+    };
 
     @Nullable
     @Override
@@ -79,15 +120,31 @@ public class OverlayService extends Service implements View.OnTouchListener {
     @Override
     public void onDestroy() {
         Log.d("OverLay", "Destroying the overlay window service");
+        if (snapAnimator != null && snapAnimator.isRunning()) {
+            snapAnimator.cancel();
+        }
+        mHandler.removeCallbacks(mLongPressRunnable);
         if (windowManager != null) {
-            windowManager.removeView(flutterView);
+            if (dismissTargetView != null) {
+                try {
+                    windowManager.removeView(dismissTargetView);
+                } catch (Exception ignored) {}
+                dismissTargetView = null;
+            }
+            if (flutterView != null) {
+                try {
+                    windowManager.removeView(flutterView);
+                } catch (Exception ignored) {}
+                flutterView.detachFromFlutterEngine();
+                flutterView = null;
+            }
             windowManager = null;
-            flutterView.detachFromFlutterEngine();
-            flutterView = null;
         }
         isRunning = false;
         NotificationManager notificationManager = (NotificationManager) getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
-        notificationManager.cancel(OverlayConstants.NOTIFICATION_ID);
+        if (notificationManager != null) {
+            notificationManager.cancel(OverlayConstants.NOTIFICATION_ID);
+        }
         instance = null;
     }
 
@@ -98,22 +155,16 @@ public class OverlayService extends Service implements View.OnTouchListener {
         int startX = intent.getIntExtra("startX", OverlayConstants.DEFAULT_XY);
         int startY = intent.getIntExtra("startY", OverlayConstants.DEFAULT_XY);
         boolean isCloseWindow = intent.getBooleanExtra(INTENT_EXTRA_IS_CLOSE_WINDOW, false);
+
         if (isCloseWindow) {
-            if (windowManager != null) {
-                windowManager.removeView(flutterView);
-                windowManager = null;
-                flutterView.detachFromFlutterEngine();
-                stopSelf();
-            }
-            isRunning = false;
+            cleanupAndDismiss();
             return START_STICKY;
         }
+
         if (windowManager != null) {
-            windowManager.removeView(flutterView);
-            windowManager = null;
-            flutterView.detachFromFlutterEngine();
-            stopSelf();
+            cleanupAndDismiss();
         }
+
         isRunning = true;
         Log.d("onStartCommand", "Service started");
         FlutterEngine engine = FlutterEngineCache.getInstance().get(OverlayConstants.CACHED_TAG);
@@ -124,6 +175,7 @@ public class OverlayService extends Service implements View.OnTouchListener {
         flutterView.setFocusable(true);
         flutterView.setFocusableInTouchMode(true);
         flutterView.setBackgroundColor(Color.TRANSPARENT);
+
         flutterChannel.setMethodCallHandler((call, result) -> {
             if (call.method.equals("updateFlag")) {
                 String flag = call.argument("flag").toString();
@@ -137,29 +189,27 @@ public class OverlayService extends Service implements View.OnTouchListener {
                 int height = call.argument("height");
                 boolean enableDrag = call.argument("enableDrag");
                 resizeOverlay(width, height, enableDrag, result);
+            } else if (call.method.equals("closeOverlay")) {
+                cleanupAndDismiss();
+                result.success(true);
             }
         });
+
         overlayMessageChannel.setMessageHandler((message, reply) -> {
             WindowSetup.messenger.send(message);
         });
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
-            windowManager.getDefaultDisplay().getSize(szWindow);
-        } else {
-            DisplayMetrics displaymetrics = new DisplayMetrics();
-            windowManager.getDefaultDisplay().getMetrics(displaymetrics);
-            int w = displaymetrics.widthPixels;
-            int h = displaymetrics.heightPixels;
-            szWindow.set(w, h);
-        }
-        int dx = startX == OverlayConstants.DEFAULT_XY ? 0 : startX;
-        int dy = startY == OverlayConstants.DEFAULT_XY ? -statusBarHeightPx() : startY;
-        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                (WindowSetup.width == -1999 || WindowSetup.width == -1) ? -1 : dpToPx(WindowSetup.width),
-                (WindowSetup.height == -1999 || WindowSetup.height == -1) ? screenHeight() : dpToPx(WindowSetup.height),
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        updateScreenDimensions();
+
+        int bubbleWidth = (WindowSetup.width == -1999 || WindowSetup.width == -1) ? szWindow.x : dpToPx(WindowSetup.width);
+        int bubbleHeight = (WindowSetup.height == -1999 || WindowSetup.height == -1) ? screenHeight() : dpToPx(WindowSetup.height);
+
+        bubbleParams = new WindowManager.LayoutParams(
+                bubbleWidth,
+                bubbleHeight,
                 0,
-                -statusBarHeightPx(),
+                0,
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
                 WindowSetup.flag | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
@@ -167,16 +217,65 @@ public class OverlayService extends Service implements View.OnTouchListener {
                         | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                 PixelFormat.TRANSLUCENT
         );
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && WindowSetup.flag == clickableFlag) {
-            params.alpha = MAXIMUM_OPACITY_ALLOWED_FOR_S_AND_HIGHER;
+            bubbleParams.alpha = 0.8f;
         }
-        params.gravity = WindowSetup.gravity;
+
+        bubbleParams.gravity = Gravity.TOP | Gravity.LEFT;
+
+        // Position bubble: start always at bottom-center of screen
+        bubbleParams.x = (szWindow.x - bubbleWidth) / 2;
+        bubbleParams.y = szWindow.y - navigationBarHeightPx() - bubbleHeight - dpToPx(35);
+
         flutterView.setOnTouchListener(this);
-        windowManager.addView(flutterView, params);
-        moveOverlay(dx, dy, null);
+        windowManager.addView(flutterView, bubbleParams);
+
+        // Add circular Dismiss (X) Drop Target View at bottom center
+        int targetSize = dpToPx(130);
+        dismissParams = new WindowManager.LayoutParams(
+                targetSize,
+                targetSize,
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT
+        );
+        dismissParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        dismissParams.y = dpToPx(35);
+
+        dismissTargetView = new DismissTargetView(getApplicationContext());
+        windowManager.addView(dismissTargetView, dismissParams);
+
         return START_STICKY;
     }
 
+    private void updateScreenDimensions() {
+        if (windowManager != null) {
+            DisplayMetrics displaymetrics = new DisplayMetrics();
+            windowManager.getDefaultDisplay().getRealMetrics(displaymetrics);
+            szWindow.set(displaymetrics.widthPixels, displaymetrics.heightPixels);
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        updateScreenDimensions();
+        if (bubbleParams != null && windowManager != null && flutterView != null) {
+            int bubbleWidth = (WindowSetup.width == -1999 || WindowSetup.width == -1) ? szWindow.x : dpToPx(WindowSetup.width);
+            int bubbleHeight = (WindowSetup.height == -1999 || WindowSetup.height == -1) ? szWindow.y : dpToPx(WindowSetup.height);
+            int minX = 0;
+            int maxX = szWindow.x - bubbleWidth;
+            int minY = statusBarHeightPx();
+            int maxY = szWindow.y - navigationBarHeightPx() - bubbleHeight;
+            bubbleParams.x = Math.max(minX, Math.min(maxX, bubbleParams.x));
+            bubbleParams.y = Math.max(minY, Math.min(maxY, bubbleParams.y));
+            windowManager.updateViewLayout(flutterView, bubbleParams);
+        }
+    }
 
     @RequiresApi(api = Build.VERSION_CODES.JELLY_BEAN_MR1)
     private int screenHeight() {
@@ -192,31 +291,26 @@ public class OverlayService extends Service implements View.OnTouchListener {
     private int statusBarHeightPx() {
         if (mStatusBarHeight == -1) {
             int statusBarHeightId = mResources.getIdentifier("status_bar_height", "dimen", "android");
-
             if (statusBarHeightId > 0) {
                 mStatusBarHeight = mResources.getDimensionPixelSize(statusBarHeightId);
             } else {
                 mStatusBarHeight = dpToPx(DEFAULT_STATUS_BAR_HEIGHT_DP);
             }
         }
-
         return mStatusBarHeight;
     }
 
     int navigationBarHeightPx() {
         if (mNavigationBarHeight == -1) {
             int navBarHeightId = mResources.getIdentifier("navigation_bar_height", "dimen", "android");
-
             if (navBarHeightId > 0) {
                 mNavigationBarHeight = mResources.getDimensionPixelSize(navBarHeightId);
             } else {
                 mNavigationBarHeight = dpToPx(DEFAULT_NAV_BAR_HEIGHT_DP);
             }
         }
-
         return mNavigationBarHeight;
     }
-
 
     private void updateOverlayFlag(MethodChannel.Result result, String flag) {
         if (windowManager != null) {
@@ -226,7 +320,7 @@ public class OverlayService extends Service implements View.OnTouchListener {
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                     WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && WindowSetup.flag == clickableFlag) {
-                params.alpha = MAXIMUM_OPACITY_ALLOWED_FOR_S_AND_HIGHER;
+                params.alpha = 0.8f;
             } else {
                 params.alpha = 1;
             }
@@ -251,47 +345,35 @@ public class OverlayService extends Service implements View.OnTouchListener {
     }
 
     private void moveOverlay(int x, int y, MethodChannel.Result result) {
-        if (windowManager != null) {
-            WindowManager.LayoutParams params = (WindowManager.LayoutParams) flutterView.getLayoutParams();
-            params.x = (x == -1999 || x == -1) ? -1 : dpToPx(x);
-            params.y = dpToPx(y);
-            windowManager.updateViewLayout(flutterView, params);
-            if (result != null)
-                result.success(true);
+        if (windowManager != null && bubbleParams != null) {
+            bubbleParams.x = (x == -1999 || x == -1) ? -1 : dpToPx(x);
+            bubbleParams.y = dpToPx(y);
+            windowManager.updateViewLayout(flutterView, bubbleParams);
+            if (result != null) result.success(true);
         } else {
-            if (result != null)
-                result.success(false);
+            if (result != null) result.success(false);
         }
     }
 
-
     public static Map<String, Double> getCurrentPosition() {
-        if (instance != null && instance.flutterView != null) {
-            WindowManager.LayoutParams params = (WindowManager.LayoutParams) instance.flutterView.getLayoutParams();
+        if (instance != null && instance.flutterView != null && instance.bubbleParams != null) {
             Map<String, Double> position = new HashMap<>();
-            position.put("x", instance.pxToDp(params.x));
-            position.put("y", instance.pxToDp(params.y));
+            position.put("x", instance.pxToDp(instance.bubbleParams.x));
+            position.put("y", instance.pxToDp(instance.bubbleParams.y));
             return position;
         }
         return null;
     }
 
     public static boolean moveOverlay(int x, int y) {
-        if (instance != null && instance.flutterView != null) {
-            if (instance.windowManager != null) {
-                WindowManager.LayoutParams params = (WindowManager.LayoutParams) instance.flutterView.getLayoutParams();
-                params.x = (x == -1999 || x == -1) ? -1 : instance.dpToPx(x);
-                params.y = instance.dpToPx(y);
-                instance.windowManager.updateViewLayout(instance.flutterView, params);
-                return true;
-            } else {
-                return false;
-            }
-        } else {
-            return false;
+        if (instance != null && instance.flutterView != null && instance.windowManager != null && instance.bubbleParams != null) {
+            instance.bubbleParams.x = (x == -1999 || x == -1) ? -1 : instance.dpToPx(x);
+            instance.bubbleParams.y = instance.dpToPx(y);
+            instance.windowManager.updateViewLayout(instance.flutterView, instance.bubbleParams);
+            return true;
         }
+        return false;
     }
-
 
     @Override
     public void onCreate() {
@@ -334,9 +416,12 @@ public class OverlayService extends Service implements View.OnTouchListener {
         return getApplicationContext().getResources().getIdentifier(String.format("ic_%s", name), resType, getApplicationContext().getPackageName());
     }
 
-    private int dpToPx(int dp) {
-        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP,
-                Float.parseFloat(dp + ""), mResources.getDisplayMetrics());
+    private int dpToPx(float dp) {
+        return (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP,
+                dp,
+                mResources.getDisplayMetrics()
+        );
     }
 
     private double pxToDp(int px) {
@@ -347,120 +432,197 @@ public class OverlayService extends Service implements View.OnTouchListener {
         return mResources.getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
     }
 
+    private void triggerHapticFeedback() {
+        try {
+            if (flutterView != null) {
+                flutterView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            }
+            Vibrator vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator != null && vibrator.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    vibrator.vibrate(35);
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
     @Override
     public boolean onTouch(View view, MotionEvent event) {
-        if (windowManager != null && WindowSetup.enableDrag) {
-            WindowManager.LayoutParams params = (WindowManager.LayoutParams) flutterView.getLayoutParams();
-            switch (event.getAction()) {
-                case MotionEvent.ACTION_DOWN:
-                    dragging = false;
-                    lastX = event.getRawX();
-                    lastY = event.getRawY();
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    float dx = event.getRawX() - lastX;
-                    float dy = event.getRawY() - lastY;
-                    if (!dragging && (dx * dx + dy * dy < 16)) {
+        if (windowManager == null || flutterView == null || !WindowSetup.enableDrag || bubbleParams == null) {
+            return false;
+        }
+
+        int bubbleWidth = (WindowSetup.width == -1999 || WindowSetup.width == -1) ? szWindow.x : dpToPx(WindowSetup.width);
+        int bubbleHeight = (WindowSetup.height == -1999 || WindowSetup.height == -1) ? szWindow.y : dpToPx(WindowSetup.height);
+        int touchSlop = ViewConfiguration.get(getApplicationContext()).getScaledTouchSlop();
+
+        switch (event.getAction()) {
+            case MotionEvent.ACTION_DOWN:
+                if (snapAnimator != null && snapAnimator.isRunning()) {
+                    snapAnimator.cancel();
+                }
+                isLongPressed = false;
+                isDragging = false;
+                isHoveringDismiss = false;
+                initialTouchRawX = event.getRawX();
+                initialTouchRawY = event.getRawY();
+                initialParamsX = bubbleParams.x;
+                initialParamsY = bubbleParams.y;
+
+                mHandler.postDelayed(mLongPressRunnable, LONG_PRESS_TIMEOUT_MS);
+                flutterView.onTouchEvent(event);
+                return true;
+
+            case MotionEvent.ACTION_MOVE:
+                float dx = event.getRawX() - initialTouchRawX;
+                float dy = event.getRawY() - initialTouchRawY;
+
+                if (!isDragging) {
+                    // Start dragging immediately once finger moves beyond touch slop!
+                    if (dx * dx + dy * dy > touchSlop * touchSlop) {
+                        isDragging = true;
+                        mHandler.removeCallbacks(mLongPressRunnable);
+                        triggerHapticFeedback();
+                        flutterView.animate().scaleX(1.06f).scaleY(1.06f).setDuration(120).start();
+
+                        // Cancel touch in Flutter so buttons inside don't trigger onTap
+                        long now = SystemClock.uptimeMillis();
+                        MotionEvent cancelEvent = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0, 0, 0);
+                        flutterView.onTouchEvent(cancelEvent);
+                        cancelEvent.recycle();
+
+                        if (dismissTargetView != null) {
+                            dismissTargetView.show();
+                        }
+                    } else {
+                        // Tiny movement within touch slop (jitter)
                         return true;
                     }
-                    lastX = event.getRawX();
-                    lastY = event.getRawY();
-                    boolean invertX = WindowSetup.gravity == (Gravity.TOP | Gravity.RIGHT)
-                            || WindowSetup.gravity == (Gravity.CENTER | Gravity.RIGHT)
-                            || WindowSetup.gravity == (Gravity.BOTTOM | Gravity.RIGHT);
-                    boolean invertY = WindowSetup.gravity == (Gravity.BOTTOM | Gravity.LEFT)
-                            || WindowSetup.gravity == Gravity.BOTTOM
-                            || WindowSetup.gravity == (Gravity.BOTTOM | Gravity.RIGHT);
-                    int xx = params.x + ((int) dx * (invertX ? -1 : 1));
-                    int yy = params.y + ((int) dy * (invertY ? -1 : 1));
-                    params.x = xx;
-                    params.y = yy;
-                    if (windowManager != null) {
-                        windowManager.updateViewLayout(flutterView, params);
+                }
+
+                // In drag mode: smoothly follow finger across screen
+                int targetX = (int) (initialParamsX + dx);
+                int targetY = (int) (initialParamsY + dy);
+
+                // Screen boundary clamping
+                int minX = 0;
+                int maxX = szWindow.x - bubbleWidth;
+                int minY = statusBarHeightPx();
+                int maxY = szWindow.y - navigationBarHeightPx() - bubbleHeight;
+
+                bubbleParams.x = Math.max(minX, Math.min(maxX, targetX));
+                bubbleParams.y = Math.max(minY, Math.min(maxY, targetY));
+
+                // Check distance to close drop target at bottom center
+                int bubbleCenterX = bubbleParams.x + bubbleWidth / 2;
+                int bubbleCenterY = bubbleParams.y + bubbleHeight / 2;
+                int targetCenterX = szWindow.x / 2;
+                int targetCenterY = szWindow.y - navigationBarHeightPx() - dpToPx(35) - dpToPx(65);
+
+                double dist = Math.hypot(bubbleCenterX - targetCenterX, bubbleCenterY - targetCenterY);
+                boolean near = dist < dpToPx(85);
+
+                if (near && !isHoveringDismiss) {
+                    isHoveringDismiss = true;
+                    if (dismissTargetView != null) {
+                        dismissTargetView.setActive(true);
                     }
-                    dragging = true;
-                    return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    lastYPosition = params.y;
+                    triggerHapticFeedback();
+                } else if (!near && isHoveringDismiss) {
+                    isHoveringDismiss = false;
+                    if (dismissTargetView != null) {
+                        dismissTargetView.setActive(false);
+                    }
+                }
 
-                    int screenH = (szWindow != null && szWindow.y > 0) ? szWindow.y : screenHeight();
-                    int windowH = (flutterView != null && flutterView.getHeight() > 0)
-                            ? flutterView.getHeight()
-                            : dpToPx(WindowSetup.height != -1999 && WindowSetup.height != -1 ? WindowSetup.height : 200);
-                    int bottomThreshold = screenH - windowH - dpToPx(60);
+                // Magnetic pull when hovering close target
+                if (isHoveringDismiss) {
+                    bubbleParams.x = (int) (bubbleParams.x + (targetCenterX - bubbleCenterX) * 0.25f);
+                    bubbleParams.y = (int) (bubbleParams.y + (targetCenterY - bubbleCenterY) * 0.25f);
+                }
 
-                    // Check if scrolled / dragged down to the bottom of the screen to close
-                    if (params.y >= bottomThreshold || lastY >= screenH - dpToPx(90)) {
-                        Log.d("OverlayService", "Overlay dragged to bottom: closing");
-                        if (WindowSetup.messenger != null) {
-                            WindowSetup.messenger.send("close");
+                windowManager.updateViewLayout(flutterView, bubbleParams);
+                return true;
+
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                mHandler.removeCallbacks(mLongPressRunnable);
+                flutterView.animate().scaleX(1.0f).scaleY(1.0f).setDuration(160).start();
+
+                if (isDragging) {
+                    if (isHoveringDismiss) {
+                        // Released inside close target: DISMISS!
+                        triggerHapticFeedback();
+                        flutterView.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(180).start();
+                        if (dismissTargetView != null) {
+                            dismissTargetView.hide(this::cleanupAndDismiss);
+                        } else {
+                            cleanupAndDismiss();
                         }
-                        if (windowManager != null) {
-                            windowManager.removeView(flutterView);
-                            windowManager = null;
-                            flutterView.detachFromFlutterEngine();
+                    } else {
+                        // Released outside close target: hide target & snap bubble to nearest screen edge
+                        if (dismissTargetView != null) {
+                            dismissTargetView.hide(null);
                         }
-                        isRunning = false;
-                        stopSelf();
-                        return true;
+                        snapBubbleToEdge(bubbleWidth, bubbleHeight);
                     }
-
-                    if (!WindowSetup.positionGravity.equals("none")) {
-                        if (windowManager == null) return true;
-                        windowManager.updateViewLayout(flutterView, params);
-                        mTrayTimerTask = new TrayAnimationTimerTask();
-                        mTrayAnimationTimer = new Timer();
-                        mTrayAnimationTimer.schedule(mTrayTimerTask, 0, 25);
-                    }
+                    isDragging = false;
+                    isLongPressed = false;
+                    isHoveringDismiss = false;
                     return true;
-                default:
-                    return false;
-            }
+                } else {
+                    // Normal tap / interaction
+                    flutterView.onTouchEvent(event);
+                    return true;
+                }
         }
         return false;
     }
 
-    private class TrayAnimationTimerTask extends TimerTask {
-        int mDestX;
-        int mDestY;
-        WindowManager.LayoutParams params = (WindowManager.LayoutParams) flutterView.getLayoutParams();
+    private void snapBubbleToEdge(int bubbleWidth, int bubbleHeight) {
+        if (windowManager == null || flutterView == null || bubbleParams == null) return;
+        int bubbleCenterX = bubbleParams.x + bubbleWidth / 2;
+        int edgeMargin = dpToPx(8);
+        int destX = (bubbleCenterX < szWindow.x / 2) ? edgeMargin : (szWindow.x - bubbleWidth - edgeMargin);
 
-        public TrayAnimationTimerTask() {
-            super();
-            mDestY = lastYPosition;
-            switch (WindowSetup.positionGravity) {
-                case "auto":
-                    mDestX = (params.x + (flutterView.getWidth() / 2)) <= szWindow.x / 2 ? 0 : szWindow.x - flutterView.getWidth();
-                    return;
-                case "left":
-                    mDestX = 0;
-                    return;
-                case "right":
-                    mDestX = szWindow.x - flutterView.getWidth();
-                    return;
-                default:
-                    mDestX = params.x;
-                    mDestY = params.y;
-                    break;
+        if (snapAnimator != null && snapAnimator.isRunning()) {
+            snapAnimator.cancel();
+        }
+        snapAnimator = ValueAnimator.ofInt(bubbleParams.x, destX);
+        snapAnimator.setDuration(350);
+        snapAnimator.setInterpolator(new OvershootInterpolator(1.15f));
+        snapAnimator.addUpdateListener(anim -> {
+            if (windowManager != null && flutterView != null && bubbleParams != null) {
+                bubbleParams.x = (int) anim.getAnimatedValue();
+                windowManager.updateViewLayout(flutterView, bubbleParams);
             }
-        }
-
-        @Override
-        public void run() {
-            mAnimationHandler.post(() -> {
-                params.x = (2 * (params.x - mDestX)) / 3 + mDestX;
-                params.y = (2 * (params.y - mDestY)) / 3 + mDestY;
-                if (windowManager != null) {
-                    windowManager.updateViewLayout(flutterView, params);
-                }
-                if (Math.abs(params.x - mDestX) < 2 && Math.abs(params.y - mDestY) < 2) {
-                    TrayAnimationTimerTask.this.cancel();
-                    mTrayAnimationTimer.cancel();
-                }
-            });
-        }
+        });
+        snapAnimator.start();
     }
 
-
+    private void cleanupAndDismiss() {
+        if (WindowSetup.messenger != null) {
+            WindowSetup.messenger.send("close");
+        }
+        if (windowManager != null) {
+            if (dismissTargetView != null) {
+                try {
+                    windowManager.removeView(dismissTargetView);
+                } catch (Exception ignored) {}
+                dismissTargetView = null;
+            }
+            if (flutterView != null) {
+                try {
+                    windowManager.removeView(flutterView);
+                } catch (Exception ignored) {}
+                flutterView.detachFromFlutterEngine();
+                flutterView = null;
+            }
+            windowManager = null;
+        }
+        isRunning = false;
+        stopSelf();
+    }
 }

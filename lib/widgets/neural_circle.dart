@@ -13,7 +13,7 @@ class NeuralCircle extends StatefulWidget {
     super.key,
     required this.state,
     required this.amplitude,
-    this.size = 220,
+    this.size = 100,
   });
 
   @override
