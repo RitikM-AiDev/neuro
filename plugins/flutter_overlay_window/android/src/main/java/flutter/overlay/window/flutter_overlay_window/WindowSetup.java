@@ -66,7 +66,8 @@ public abstract class WindowSetup {
             return;
         }
         if (alignment.equalsIgnoreCase("topCenter")) {
-            gravity = Gravity.TOP;
+            gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+            return;
         }
         if (alignment.equalsIgnoreCase("topRight")) {
             gravity = Gravity.TOP | Gravity.RIGHT;
@@ -79,6 +80,7 @@ public abstract class WindowSetup {
         }
         if (alignment.equalsIgnoreCase("center")) {
             gravity = Gravity.CENTER;
+            return;
         }
         if (alignment.equalsIgnoreCase("centerRight")) {
             gravity = Gravity.CENTER | Gravity.RIGHT;
@@ -90,7 +92,8 @@ public abstract class WindowSetup {
             return;
         }
         if (alignment.equalsIgnoreCase("bottomCenter")) {
-            gravity = Gravity.BOTTOM;
+            gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            return;
         }
         if (alignment.equalsIgnoreCase("bottomRight")) {
             gravity = Gravity.BOTTOM | Gravity.RIGHT;

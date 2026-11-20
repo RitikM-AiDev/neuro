@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
@@ -77,7 +78,7 @@ class _NeuralOverlayAppState extends State<NeuralOverlayApp> {
           child: NeuralCircle(
             state: _state,
             amplitude: _amplitude,
-            size: 190,
+            size: 100,
           ),
         ),
       ),
@@ -118,17 +119,26 @@ class HeadlessLauncher extends StatefulWidget {
   State<HeadlessLauncher> createState() => _HeadlessLauncherState();
 }
 
-class _HeadlessLauncherState extends State<HeadlessLauncher> {
+class _HeadlessLauncherState extends State<HeadlessLauncher>
+    with WidgetsBindingObserver {
   static const MethodChannel _controlChannel =
       MethodChannel('com.example.neuro_apps/control');
 
   late final VoiceDetectorService _voiceService;
-  bool _needsPermissions = false;
-  bool _isRequesting = false;
+  Timer? _permissionPollTimer;
+  bool _isStartingOverlay = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _controlChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onAppReopened') {
+        await _checkAndExecute(forceOpen: true);
+      }
+    });
+
     _voiceService = VoiceDetectorService(
       onVoiceStateChanged: (state, amp) {
         if (state == AssistantState.listening) {
@@ -139,62 +149,130 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
       },
     );
 
-    // Listen for close signal from native Android when dragged all the way down
+    // Listen for close signal from overlay or native service
     FlutterOverlayWindow.overlayListener.listen((data) async {
       if (data == 'close') {
         await _voiceService.stopListening();
+        await FlutterOverlayWindow.closeOverlay();
       }
     });
 
-    _checkAndExecute();
+    _initPermissionsAndStart();
   }
 
-  Future<void> _checkAndExecute() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkAndExecute(forceOpen: true);
+    }
+  }
+
+  Future<void> _initPermissionsAndStart() async {
     final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
     final micGranted = await _voiceService.hasPermission(request: false);
 
     if (overlayGranted && micGranted) {
-      await _toggleOrStartOverlay();
+      await _toggleOrStartOverlay(forceOpen: true);
+      return;
+    }
+
+    // 1. Request microphone permission directly from Android OS dialog
+    if (!micGranted) {
+      await _voiceService.hasPermission(request: true);
+    }
+
+    // 2. Request overlay permission directly from Android system settings
+    final hasOverlay = await FlutterOverlayWindow.isPermissionGranted();
+    if (!hasOverlay) {
+      _startPermissionPolling();
+      FlutterOverlayWindow.requestPermission().then((granted) async {
+        if (granted == true) {
+          final mic = await _voiceService.hasPermission(request: false);
+          if (mic) {
+            _stopPermissionPolling();
+            await _toggleOrStartOverlay(forceOpen: true);
+          }
+        }
+      }).catchError((_) {});
     } else {
-      if (mounted) {
-        setState(() => _needsPermissions = true);
+      final mic = await _voiceService.hasPermission(request: false);
+      if (mic) {
+        await _toggleOrStartOverlay(forceOpen: true);
       }
     }
   }
 
-  Future<void> _toggleOrStartOverlay() async {
-    final isActive = await FlutterOverlayWindow.isActive();
+  void _startPermissionPolling() {
+    _permissionPollTimer?.cancel();
+    _permissionPollTimer =
+        Timer.periodic(const Duration(milliseconds: 500), (timer) async {
+      final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
+      if (overlayGranted) {
+        final micGranted = await _voiceService.hasPermission(request: false);
+        if (micGranted) {
+          _stopPermissionPolling();
+          await _toggleOrStartOverlay(forceOpen: true);
+        }
+      }
+    });
+  }
 
-    if (isActive) {
-      // If already active when launched, toggle it off (clean exit)
-      await _voiceService.stopListening();
-      await FlutterOverlayWindow.closeOverlay();
-      await _minimizeApp();
-      return;
+  void _stopPermissionPolling() {
+    _permissionPollTimer?.cancel();
+    _permissionPollTimer = null;
+  }
+
+  Future<void> _checkAndExecute({bool forceOpen = false}) async {
+    final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
+    final micGranted = await _voiceService.hasPermission(request: false);
+
+    if (overlayGranted && micGranted) {
+      _stopPermissionPolling();
+      await _toggleOrStartOverlay(forceOpen: forceOpen);
     }
+  }
 
-    // 1. Show floating overlay window
-    // enableDrag: true enables native touch drag in Android WindowManager.
-    // flag: defaultFlag (FLAG_NOT_FOCUSABLE) allows all touches outside the
-    // 200x200 window to pass straight through to background apps.
-    await FlutterOverlayWindow.showOverlay(
-      enableDrag: true,
-      overlayTitle: 'Neuro Assistant',
-      overlayContent: 'Neural Voice Assistant Active',
-      flag: OverlayFlag.defaultFlag,
-      alignment: OverlayAlignment.topLeft,
-      startPosition: const OverlayPosition(20, 150),
-      visibility: NotificationVisibility.visibilityPublic,
-      positionGravity: PositionGravity.none,
-      height: 200,
-      width: 200,
-    );
+  Future<void> _toggleOrStartOverlay({bool forceOpen = false}) async {
+    if (_isStartingOverlay) return;
+    _isStartingOverlay = true;
 
-    // 2. Start continuous voice detection
-    await _voiceService.startListening();
+    try {
+      final isActive = await FlutterOverlayWindow.isActive();
 
-    // 3. Immediately minimize app so no full-screen window is ever visible
-    await _minimizeApp();
+      if (isActive && !forceOpen) {
+        // If already active when launched normally, toggle it off (clean exit)
+        await _voiceService.stopListening();
+        await FlutterOverlayWindow.closeOverlay();
+        await _minimizeApp();
+        return;
+      }
+
+      if (!isActive) {
+        // 1. Show floating overlay window
+        // enableDrag: true enables native touch drag in Android WindowManager.
+        // Starts at bottom center of screen whenever called.
+        await FlutterOverlayWindow.showOverlay(
+          enableDrag: true,
+          overlayTitle: 'Neuro Assistant',
+          overlayContent: 'Neural Voice Assistant Active',
+          flag: OverlayFlag.defaultFlag,
+          alignment: OverlayAlignment.bottomCenter,
+          startPosition: const OverlayPosition(0, 30),
+          visibility: NotificationVisibility.visibilityPublic,
+          positionGravity: PositionGravity.none,
+          height: 110,
+          width: 110,
+        );
+
+        // 2. Start continuous voice detection
+        await _voiceService.startListening();
+      }
+
+      // 3. Immediately minimize app so no full-screen window is ever visible
+      await _minimizeApp();
+    } finally {
+      _isStartingOverlay = false;
+    }
   }
 
   Future<void> _minimizeApp() async {
@@ -203,117 +281,19 @@ class _HeadlessLauncherState extends State<HeadlessLauncher> {
     } catch (_) {}
   }
 
-  Future<void> _requestPermissionsAndStart() async {
-    if (_isRequesting) return;
-    setState(() => _isRequesting = true);
-
-    final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
-    if (!overlayGranted) {
-      await FlutterOverlayWindow.requestPermission();
-    }
-
-    final micGranted = await _voiceService.hasPermission(request: true);
-    final hasOverlay = await FlutterOverlayWindow.isPermissionGranted();
-
-    if (hasOverlay && micGranted) {
-      if (mounted) setState(() => _needsPermissions = false);
-      await _toggleOrStartOverlay();
-    } else {
-      if (mounted) setState(() => _isRequesting = false);
-    }
-  }
-
   @override
   void dispose() {
+    _stopPermissionPolling();
+    WidgetsBinding.instance.removeObserver(this);
     _voiceService.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_needsPermissions) {
-      return const Scaffold(
-        backgroundColor: Colors.transparent,
-        body: SizedBox.shrink(),
-      );
-    }
-
-    return Scaffold(
+    return const Scaffold(
       backgroundColor: Colors.transparent,
-      body: Center(
-        child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 32),
-          padding: const EdgeInsets.all(24),
-          decoration: BoxDecoration(
-            color: const Color(0xFF050810).withValues(alpha: 0.92),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
-              width: 1.5,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
-                blurRadius: 24,
-                spreadRadius: 2,
-              ),
-            ],
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                'NEURAL ASSISTANT',
-                style: TextStyle(
-                  color: Color(0xFF00E5FF),
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 3,
-                ),
-              ),
-              const SizedBox(height: 14),
-              const Text(
-                'Enable Overlay & Microphone access to let the neural circle float above other apps and react to voice.',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                  height: 1.4,
-                ),
-              ),
-              const SizedBox(height: 22),
-              GestureDetector(
-                onTap: _requestPermissionsAndStart,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(30),
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF00E5FF), Color(0xFF7B2FBE)],
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
-                        blurRadius: 14,
-                      ),
-                    ],
-                  ),
-                  child: Text(
-                    _isRequesting ? 'Authorizing...' : 'Grant & Activate',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 13,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
+      body: SizedBox.shrink(),
     );
   }
 }

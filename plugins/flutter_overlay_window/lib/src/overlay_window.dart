@@ -91,8 +91,14 @@ class FlutterOverlayWindow {
 
   /// Closes overlay if open
   static Future<bool?> closeOverlay() async {
-    final bool? res = await _channel.invokeMethod('closeOverlay');
-    return res;
+    try {
+      await _overlayChannel.invokeMethod('closeOverlay');
+    } catch (_) {}
+    try {
+      return await _channel.invokeMethod('closeOverlay');
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Broadcast data to and from overlay app
