@@ -4,12 +4,11 @@
     <!-- Overlay -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 
-    <!-- Microphone -->
+    <!-- Microphone for Assistant -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 
     <!-- Foreground services -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
 
     <!-- Notifications -->
@@ -28,8 +27,6 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:taskAffinity=""
-            android:excludeFromRecents="true"
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
@@ -95,11 +92,11 @@
 
         </service>
 
-        <!-- Flutter Overlay Service with Foreground Microphone Access -->
+        <!-- The overlay draws UI only. -->
         <service
             android:name="flutter.overlay.window.flutter_overlay_window.OverlayService"
             android:exported="false"
-            android:foregroundServiceType="specialUse|microphone">
+            android:foregroundServiceType="specialUse">
 
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
@@ -114,6 +111,9 @@
     </application>
 
     <queries>
+
+        <package android:name="com.google.android.tts"/>
+        <package android:name="com.google.android.googlequicksearchbox"/>
 
         <intent>
             <action android:name="android.speech.RecognitionService"/>

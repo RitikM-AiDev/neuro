@@ -142,6 +142,11 @@ public class OverlayService extends Service implements View.OnTouchListener {
             windowManager = null;
         }
         isRunning = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } else {
+            stopForeground(true);
+        }
         NotificationManager notificationManager = (NotificationManager) getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
         if (notificationManager != null) {
             notificationManager.cancel(OverlayConstants.NOTIFICATION_ID);
@@ -397,11 +402,13 @@ public class OverlayService extends Service implements View.OnTouchListener {
                 .setVisibility(WindowSetup.notificationVisibility)
                 .build();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                serviceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
-            }
-            startForeground(OverlayConstants.NOTIFICATION_ID, notification, serviceType);
+            // This service owns the floating UI only. Declaring microphone here
+            // conflicts with AudioListeningService, the sole audio owner.
+            startForeground(
+                    OverlayConstants.NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            );
         } else {
             startForeground(OverlayConstants.NOTIFICATION_ID, notification);
         }
@@ -632,6 +639,15 @@ public class OverlayService extends Service implements View.OnTouchListener {
             windowManager = null;
         }
         isRunning = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } else {
+            stopForeground(true);
+        }
+        NotificationManager notificationManager = (NotificationManager) getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        if (notificationManager != null) {
+            notificationManager.cancel(OverlayConstants.NOTIFICATION_ID);
+        }
         stopSelf();
     }
 }
