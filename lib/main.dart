@@ -160,9 +160,19 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
           FlutterOverlayWindow.shareData(
             'listening:${amp.toStringAsFixed(3)}',
           );
+        } else if (state == AssistantState.thinking) {
+          FlutterOverlayWindow.shareData('thinking:0.0');
+        } else if (state == AssistantState.speaking) {
+          FlutterOverlayWindow.shareData(
+            'speaking:${amp.toStringAsFixed(3)}',
+          );
         } else {
           FlutterOverlayWindow.shareData('idle:0.0');
         }
+      },
+      onSpeechRecognized: (text) {
+        debugPrint('[Neuro] Speech recognized: $text');
+        FlutterOverlayWindow.shareData('speaking:0.8');
       },
     );
 
@@ -310,9 +320,9 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
 
       await _minimizeApp();
 
-      // Download or reuse the local Silero VAD model in background and initialize Sherpa.
+      // Download or reuse the local VAD & STT models in background and initialize Sherpa.
       if (!_voiceService.isInitialized) {
-        _initSherpaVad();
+        _initSherpaModels();
       }
     } catch (e, stackTrace) {
       debugPrint('Neuro startup error: $e');
@@ -322,22 +332,24 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
     }
   }
 
-  Future<void> _initSherpaVad() async {
+  Future<void> _initSherpaModels() async {
     try {
-      final modelPath = await _modelManager.ensureVadModel(
-        onProgress: (progress) {
+      final models = await _modelManager.ensureAllModels(
+        onProgress: (modelName, progress) {
           debugPrint(
-            'VAD model download: ${(progress * 100).toStringAsFixed(1)}%',
+            'Model [$modelName] download: ${(progress * 100).toStringAsFixed(1)}%',
           );
         },
       );
 
       await _voiceService.initialize(
-        vadModelPath: modelPath,
+        vadModelPath: models.vadModelPath,
+        sttModelPath: models.sttModelPath,
+        sttTokensPath: models.sttTokensPath,
       );
-      debugPrint('Sherpa Silero VAD initialized.');
+      debugPrint('Sherpa Silero VAD + SenseVoice STT initialized.');
     } catch (e) {
-      debugPrint('Sherpa VAD background init: $e (using RMS audio fallback)');
+      debugPrint('Sherpa models background init: $e (using RMS audio fallback)');
     }
   }
 

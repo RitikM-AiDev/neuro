@@ -1,8 +1,8 @@
-
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
@@ -11,12 +11,14 @@ import '../models/assistant_state.dart';
 class VoiceDetectorService {
   final void Function(AssistantState state, double amplitude)
       onVoiceStateChanged;
+  final void Function(String recognizedText)? onSpeechRecognized;
 
   final AudioRecorder _recorder = AudioRecorder();
 
   StreamSubscription<Uint8List>? _streamSub;
 
   sherpa.VoiceActivityDetector? _vad;
+  sherpa.OfflineRecognizer? _recognizer;
 
   bool _isListening = false;
   bool _isVoiceActive = false;
@@ -28,13 +30,16 @@ class VoiceDetectorService {
   static const int _frameSize = 512;
 
   final List<double> _audioBuffer = [];
+  final List<double> _speechSamples = [];
 
   VoiceDetectorService({
     required this.onVoiceStateChanged,
+    this.onSpeechRecognized,
   });
 
   bool get isListening => _isListening;
   bool get isInitialized => _isInitialized;
+  bool get hasRecognizer => _recognizer != null;
 
   Future<bool> hasPermission({bool request = false}) async {
     return _recorder.hasPermission(request: request);
@@ -42,11 +47,14 @@ class VoiceDetectorService {
 
   Future<void> initialize({
     required String vadModelPath,
+    String? sttModelPath,
+    String? sttTokensPath,
   }) async {
     if (_isInitialized) return;
 
     await sherpa.initBindingsAsync();
 
+    // 1. Initialize Silero VAD
     final config = sherpa.VadModelConfig(
       sileroVad: sherpa.SileroVadModelConfig(
         model: vadModelPath,
@@ -67,6 +75,31 @@ class VoiceDetectorService {
       bufferSizeInSeconds: 30,
     );
 
+    // 2. Initialize Offline Speech Recognizer (SenseVoice) if models provided
+    if (sttModelPath != null &&
+        sttTokensPath != null &&
+        sttModelPath.isNotEmpty &&
+        sttTokensPath.isNotEmpty) {
+      try {
+        final sttConfig = sherpa.OfflineRecognizerConfig(
+          model: sherpa.OfflineModelConfig(
+            senseVoice: sherpa.OfflineSenseVoiceModelConfig(
+              model: sttModelPath,
+              language: 'auto',
+              useInverseTextNormalization: true,
+            ),
+            tokens: sttTokensPath,
+            numThreads: 2,
+            debug: false,
+          ),
+        );
+        _recognizer = sherpa.OfflineRecognizer(sttConfig);
+        debugPrint('Sherpa-ONNX STT SenseVoice recognizer initialized successfully.');
+      } catch (e) {
+        debugPrint('Failed to initialize STT recognizer: $e');
+      }
+    }
+
     _isInitialized = true;
   }
 
@@ -80,6 +113,7 @@ class VoiceDetectorService {
     }
 
     _audioBuffer.clear();
+    _speechSamples.clear();
     _vad?.reset();
 
     final stream = await _recorder.startStream(
@@ -130,9 +164,10 @@ class VoiceDetectorService {
         _processVadFrame(frame);
       }
     } else {
-      // Immediate fallback to RMS voice reactivity until Sherpa VAD model is loaded
+      // Immediate fallback to RMS reactivity until Sherpa VAD is loaded
       if (rms > 0.02) {
         _isVoiceActive = true;
+        _speechSamples.addAll(samples);
         onVoiceStateChanged(
           AssistantState.listening,
           _smoothAmp,
@@ -140,10 +175,7 @@ class VoiceDetectorService {
       } else if (_isVoiceActive) {
         _isVoiceActive = false;
         _smoothAmp = 0.0;
-        onVoiceStateChanged(
-          AssistantState.idle,
-          0.0,
-        );
+        _processSpeechSegment();
       }
     }
   }
@@ -182,6 +214,7 @@ class VoiceDetectorService {
 
     if (detected) {
       _isVoiceActive = true;
+      _speechSamples.addAll(frame);
 
       onVoiceStateChanged(
         AssistantState.listening,
@@ -190,12 +223,50 @@ class VoiceDetectorService {
     } else if (_isVoiceActive) {
       _isVoiceActive = false;
       _smoothAmp = 0.0;
-
-      onVoiceStateChanged(
-        AssistantState.idle,
-        0.0,
-      );
+      _processSpeechSegment();
     }
+  }
+
+  Future<void> _processSpeechSegment() async {
+    final recognizer = _recognizer;
+
+    // Minimum 400ms audio required for speech transcription
+    if (recognizer == null || _speechSamples.length < (_sampleRate * 0.4)) {
+      _speechSamples.clear();
+      onVoiceStateChanged(AssistantState.idle, 0.0);
+      return;
+    }
+
+    final samples = Float32List.fromList(_speechSamples);
+    _speechSamples.clear();
+
+    onVoiceStateChanged(AssistantState.thinking, 0.0);
+
+    try {
+      final stream = recognizer.createStream();
+      stream.acceptWaveform(samples: samples, sampleRate: _sampleRate);
+      recognizer.decode(stream);
+      final result = recognizer.getResult(stream);
+      final text = result.text.trim();
+      stream.free();
+
+      if (text.isNotEmpty) {
+        debugPrint('[Sherpa STT Result]: $text');
+        onSpeechRecognized?.call(text);
+        onVoiceStateChanged(AssistantState.speaking, 0.85);
+
+        Future.delayed(const Duration(milliseconds: 1500), () {
+          if (!_isVoiceActive && _isListening) {
+            onVoiceStateChanged(AssistantState.idle, 0.0);
+          }
+        });
+        return;
+      }
+    } catch (e) {
+      debugPrint('Error during Sherpa STT decode: $e');
+    }
+
+    onVoiceStateChanged(AssistantState.idle, 0.0);
   }
 
   Future<void> stopListening() async {
@@ -211,6 +282,7 @@ class VoiceDetectorService {
     }
 
     _audioBuffer.clear();
+    _speechSamples.clear();
 
     _isVoiceActive = false;
     _smoothAmp = 0.0;
@@ -228,6 +300,9 @@ class VoiceDetectorService {
 
     _vad?.free();
     _vad = null;
+
+    _recognizer?.free();
+    _recognizer = null;
 
     _isInitialized = false;
 
