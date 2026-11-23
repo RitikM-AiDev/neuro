@@ -1,12 +1,15 @@
+
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
+
 import 'models/assistant_state.dart';
 import 'services/voice_detector_service.dart';
+import 'services/neuro_model_manager.dart';
 import 'widgets/neural_circle.dart';
 
-// ─── Floating Overlay Entry Point (Separate Dart Isolate) ────────────────────
 @pragma('vm:entry-point')
 void overlayMain() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,54 +20,58 @@ class NeuralOverlayApp extends StatefulWidget {
   const NeuralOverlayApp({super.key});
 
   @override
-  State<NeuralOverlayApp> createState() => _NeuralOverlayAppState();
+  State<NeuralOverlayApp> createState() =>
+      _NeuralOverlayAppState();
 }
 
 class _NeuralOverlayAppState extends State<NeuralOverlayApp> {
   AssistantState _state = AssistantState.idle;
   double _amplitude = 0.0;
 
+  StreamSubscription? _overlaySubscription;
+
   @override
   void initState() {
     super.initState();
 
-    // Listen to real-time events (mic amplitude, state, etc.)
-    FlutterOverlayWindow.overlayListener.listen((data) {
-      if (data == null) return;
+    _overlaySubscription =
+        FlutterOverlayWindow.overlayListener.listen((data) {
+      if (!mounted || data == null) return;
+
       final msg = data.toString();
 
       if (msg.startsWith('listening:')) {
         final amp = double.tryParse(msg.substring(10)) ?? 0.0;
-        if (mounted) {
-          setState(() {
-            _state = AssistantState.listening;
-            _amplitude = amp;
-          });
-        }
+
+        setState(() {
+          _state = AssistantState.listening;
+          _amplitude = amp;
+        });
       } else if (msg.startsWith('idle')) {
-        if (mounted) {
-          setState(() {
-            _state = AssistantState.idle;
-            _amplitude = 0.0;
-          });
-        }
+        setState(() {
+          _state = AssistantState.idle;
+          _amplitude = 0.0;
+        });
       } else if (msg.startsWith('thinking')) {
-        if (mounted) {
-          setState(() {
-            _state = AssistantState.thinking;
-            _amplitude = 0.0;
-          });
-        }
+        setState(() {
+          _state = AssistantState.thinking;
+          _amplitude = 0.0;
+        });
       } else if (msg.startsWith('speaking:')) {
         final amp = double.tryParse(msg.substring(9)) ?? 0.0;
-        if (mounted) {
-          setState(() {
-            _state = AssistantState.speaking;
-            _amplitude = amp;
-          });
-        }
+
+        setState(() {
+          _state = AssistantState.speaking;
+          _amplitude = amp;
+        });
       }
     });
+  }
+
+  @override
+  void dispose() {
+    _overlaySubscription?.cancel();
+    super.dispose();
   }
 
   @override
@@ -73,7 +80,7 @@ class _NeuralOverlayAppState extends State<NeuralOverlayApp> {
       debugShowCheckedModeBanner: false,
       color: Colors.transparent,
       home: Scaffold(
-        backgroundColor: Colors.transparent, // Fully transparent window
+        backgroundColor: Colors.transparent,
         body: Center(
           child: NeuralCircle(
             state: _state,
@@ -86,7 +93,6 @@ class _NeuralOverlayAppState extends State<NeuralOverlayApp> {
   }
 }
 
-// ─── Main Controller Entry Point (Zero Full-Screen UI) ───────────────────────
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const NeuroControllerApp());
@@ -116,7 +122,8 @@ class HeadlessLauncher extends StatefulWidget {
   const HeadlessLauncher({super.key});
 
   @override
-  State<HeadlessLauncher> createState() => _HeadlessLauncherState();
+  State<HeadlessLauncher> createState() =>
+      _HeadlessLauncherState();
 }
 
 class _HeadlessLauncherState extends State<HeadlessLauncher>
@@ -125,12 +132,20 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
       MethodChannel('com.example.neuro_apps/control');
 
   late final VoiceDetectorService _voiceService;
+
+  final NeuroModelManager _modelManager = NeuroModelManager();
+
+  StreamSubscription? _overlaySubscription;
+
   Timer? _permissionPollTimer;
+
   bool _isStartingOverlay = false;
+  bool _isDisposed = false;
 
   @override
   void initState() {
     super.initState();
+
     WidgetsBinding.instance.addObserver(this);
 
     _controlChannel.setMethodCallHandler((call) async {
@@ -142,15 +157,17 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
     _voiceService = VoiceDetectorService(
       onVoiceStateChanged: (state, amp) {
         if (state == AssistantState.listening) {
-          FlutterOverlayWindow.shareData('listening:${amp.toStringAsFixed(3)}');
+          FlutterOverlayWindow.shareData(
+            'listening:${amp.toStringAsFixed(3)}',
+          );
         } else {
           FlutterOverlayWindow.shareData('idle:0.0');
         }
       },
     );
 
-    // Listen for close signal from overlay or native service
-    FlutterOverlayWindow.overlayListener.listen((data) async {
+    _overlaySubscription =
+        FlutterOverlayWindow.overlayListener.listen((data) async {
       if (data == 'close') {
         await _voiceService.stopListening();
         await FlutterOverlayWindow.closeOverlay();
@@ -168,26 +185,33 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
   }
 
   Future<void> _initPermissionsAndStart() async {
-    final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
-    final micGranted = await _voiceService.hasPermission(request: false);
+    final overlayGranted =
+        await FlutterOverlayWindow.isPermissionGranted();
+
+    final micGranted =
+        await _voiceService.hasPermission(request: false);
 
     if (overlayGranted && micGranted) {
       await _toggleOrStartOverlay(forceOpen: true);
       return;
     }
 
-    // 1. Request microphone permission directly from Android OS dialog
     if (!micGranted) {
       await _voiceService.hasPermission(request: true);
     }
 
-    // 2. Request overlay permission directly from Android system settings
-    final hasOverlay = await FlutterOverlayWindow.isPermissionGranted();
+    final hasOverlay =
+        await FlutterOverlayWindow.isPermissionGranted();
+
     if (!hasOverlay) {
       _startPermissionPolling();
+
       FlutterOverlayWindow.requestPermission().then((granted) async {
         if (granted == true) {
-          final mic = await _voiceService.hasPermission(request: false);
+          final mic = await _voiceService.hasPermission(
+            request: false,
+          );
+
           if (mic) {
             _stopPermissionPolling();
             await _toggleOrStartOverlay(forceOpen: true);
@@ -195,7 +219,10 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
         }
       }).catchError((_) {});
     } else {
-      final mic = await _voiceService.hasPermission(request: false);
+      final mic = await _voiceService.hasPermission(
+        request: false,
+      );
+
       if (mic) {
         await _toggleOrStartOverlay(forceOpen: true);
       }
@@ -204,11 +231,16 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
 
   void _startPermissionPolling() {
     _permissionPollTimer?.cancel();
+
     _permissionPollTimer =
         Timer.periodic(const Duration(milliseconds: 500), (timer) async {
-      final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
+      final overlayGranted =
+          await FlutterOverlayWindow.isPermissionGranted();
+
       if (overlayGranted) {
-        final micGranted = await _voiceService.hasPermission(request: false);
+        final micGranted =
+            await _voiceService.hasPermission(request: false);
+
         if (micGranted) {
           _stopPermissionPolling();
           await _toggleOrStartOverlay(forceOpen: true);
@@ -222,35 +254,58 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
     _permissionPollTimer = null;
   }
 
-  Future<void> _checkAndExecute({bool forceOpen = false}) async {
-    final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
-    final micGranted = await _voiceService.hasPermission(request: false);
+  Future<void> _checkAndExecute({
+    bool forceOpen = false,
+  }) async {
+    final overlayGranted =
+        await FlutterOverlayWindow.isPermissionGranted();
+
+    final micGranted =
+        await _voiceService.hasPermission(request: false);
 
     if (overlayGranted && micGranted) {
       _stopPermissionPolling();
-      await _toggleOrStartOverlay(forceOpen: forceOpen);
+
+      await _toggleOrStartOverlay(
+        forceOpen: forceOpen,
+      );
     }
   }
 
-  Future<void> _toggleOrStartOverlay({bool forceOpen = false}) async {
-    if (_isStartingOverlay) return;
+  Future<void> _toggleOrStartOverlay({
+    bool forceOpen = false,
+  }) async {
+    if (_isStartingOverlay || _isDisposed) return;
+
     _isStartingOverlay = true;
 
     try {
       final isActive = await FlutterOverlayWindow.isActive();
 
       if (isActive && !forceOpen) {
-        // If already active when launched normally, toggle it off (clean exit)
         await _voiceService.stopListening();
         await FlutterOverlayWindow.closeOverlay();
         await _minimizeApp();
         return;
       }
 
+      // Download or reuse the local Silero VAD model.
+      if (!_voiceService.isInitialized) {
+        final modelPath = await _modelManager.ensureVadModel(
+          onProgress: (progress) {
+            debugPrint(
+              'VAD model download: ${(progress * 100).toStringAsFixed(1)}%',
+            );
+          },
+        );
+
+        // Initialize Sherpa before starting the microphone.
+        await _voiceService.initialize(
+          vadModelPath: modelPath,
+        );
+      }
+
       if (!isActive) {
-        // 1. Show floating overlay window
-        // enableDrag: true enables native touch drag in Android WindowManager.
-        // Starts at bottom center of screen whenever called.
         await FlutterOverlayWindow.showOverlay(
           enableDrag: true,
           overlayTitle: 'Neuro Assistant',
@@ -263,13 +318,16 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
           height: 110,
           width: 110,
         );
+      }
 
-        // 2. Start continuous voice detection
+      if (!_voiceService.isListening) {
         await _voiceService.startListening();
       }
 
-      // 3. Immediately minimize app so no full-screen window is ever visible
       await _minimizeApp();
+    } catch (e, stackTrace) {
+      debugPrint('Neuro startup error: $e');
+      debugPrintStack(stackTrace: stackTrace);
     } finally {
       _isStartingOverlay = false;
     }
@@ -283,9 +341,16 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
 
   @override
   void dispose() {
+    _isDisposed = true;
+
     _stopPermissionPolling();
+
+    _overlaySubscription?.cancel();
+
     WidgetsBinding.instance.removeObserver(this);
+
     _voiceService.dispose();
+
     super.dispose();
   }
 

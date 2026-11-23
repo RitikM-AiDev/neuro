@@ -1,124 +1,221 @@
+
 import 'dart:async';
 import 'dart:math';
+import 'dart:typed_data';
+
 import 'package:record/record.dart';
+import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
+
 import '../models/assistant_state.dart';
 
 class VoiceDetectorService {
-  final void Function(AssistantState state, double amplitude) onVoiceStateChanged;
+  final void Function(AssistantState state, double amplitude)
+      onVoiceStateChanged;
 
   final AudioRecorder _recorder = AudioRecorder();
-  StreamSubscription? _streamSub;
-  StreamSubscription? _ampSub;
-  Timer? _silenceTimer;
 
-  bool _isVoiceActive = false;
+  StreamSubscription<Uint8List>? _streamSub;
+
+  sherpa.VoiceActivityDetector? _vad;
+
   bool _isListening = false;
+  bool _isVoiceActive = false;
+  bool _isInitialized = false;
+
   double _smoothAmp = 0.0;
 
-  VoiceDetectorService({required this.onVoiceStateChanged});
+  static const int _sampleRate = 16000;
+  static const int _frameSize = 512;
+
+  final List<double> _audioBuffer = [];
+
+  VoiceDetectorService({
+    required this.onVoiceStateChanged,
+  });
 
   bool get isListening => _isListening;
+  bool get isInitialized => _isInitialized;
 
   Future<bool> hasPermission({bool request = false}) async {
-    return await _recorder.hasPermission(request: request);
+    return _recorder.hasPermission(request: request);
+  }
+
+  Future<void> initialize({
+    required String vadModelPath,
+  }) async {
+    if (_isInitialized) return;
+
+    await sherpa.initBindingsAsync();
+
+    final config = sherpa.VadModelConfig(
+      sileroVad: sherpa.SileroVadModelConfig(
+        model: vadModelPath,
+        threshold: 0.5,
+        minSilenceDuration: 0.5,
+        minSpeechDuration: 0.25,
+        maxSpeechDuration: 20.0,
+        windowSize: _frameSize,
+      ),
+      sampleRate: _sampleRate,
+      numThreads: 2,
+      provider: 'cpu',
+      debug: false,
+    );
+
+    _vad = sherpa.VoiceActivityDetector(
+      config: config,
+      bufferSizeInSeconds: 30,
+    );
+
+    _isInitialized = true;
   }
 
   Future<void> startListening() async {
     if (_isListening) return;
 
-    final hasPerm = await _recorder.hasPermission();
-    if (!hasPerm) return;
+    if (!_isInitialized || _vad == null) {
+      throw StateError('VAD has not been initialized.');
+    }
 
-    try {
-      final stream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: 16000,
-          numChannels: 1,
-        ),
+    final permission = await _recorder.hasPermission();
+
+    if (!permission) {
+      throw StateError('Microphone permission not granted.');
+    }
+
+    _audioBuffer.clear();
+    _vad!.reset();
+
+    final stream = await _recorder.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: _sampleRate,
+        numChannels: 1,
+      ),
+    );
+
+    _isListening = true;
+
+    _streamSub = stream.listen(
+      _processAudio,
+      onError: (error) {
+        stopListening();
+      },
+      onDone: () {
+        _isListening = false;
+      },
+    );
+  }
+
+  void _processAudio(Uint8List bytes) {
+    if (!_isListening || bytes.length < 2) return;
+
+    final samples = _convertPcm16ToFloat(bytes);
+
+    if (samples.isEmpty) return;
+
+    final rms = _calculateRms(samples);
+
+    final rawAmplitude = (rms * 4.0).clamp(0.0, 1.0);
+
+    _smoothAmp = _smoothAmp * 0.3 + rawAmplitude * 0.7;
+
+    _audioBuffer.addAll(samples);
+
+    while (_audioBuffer.length >= _frameSize) {
+      final frame = Float32List.fromList(
+        _audioBuffer.sublist(0, _frameSize),
       );
 
-      _isListening = true;
+      _audioBuffer.removeRange(0, _frameSize);
 
-      // 1. Process real-time PCM bytes for instantaneous RMS amplitude calculation
-      _streamSub = stream.listen((bytes) {
-        if (bytes.length < 2) return;
-        int sumSquares = 0;
-        final sampleCount = bytes.length ~/ 2;
-        for (int i = 0; i < bytes.length - 1; i += 2) {
-          int sample = bytes[i] | (bytes[i + 1] << 8);
-          if (sample >= 32768) sample -= 65536;
-          sumSquares += sample * sample;
-        }
-        final double rms = sqrt(sumSquares / sampleCount);
-
-        // Voice detection threshold: RMS > 550 (approx -36 dBFS)
-        if (rms > 550) {
-          final double rawNorm = ((rms - 500) / 4500).clamp(0.0, 1.0);
-          _onVoiceSignal(rawNorm);
-        } else {
-          _onSilenceSignal();
-        }
-      }, onError: (_) {
-        // Stream error handling
-      });
-
-      // 2. Also listen to hardware amplitude events for extra fidelity
-      _ampSub = _recorder.onAmplitudeChanged(const Duration(milliseconds: 60)).listen((amp) {
-        if (amp.current > -38.0 || amp.max > -32.0) {
-          final double rawNorm = ((amp.current - (-40.0)) / 28.0).clamp(0.0, 1.0);
-          _onVoiceSignal(rawNorm);
-        } else {
-          _onSilenceSignal();
-        }
-      });
-    } catch (_) {
-      _isListening = false;
+      _processVadFrame(frame);
     }
   }
 
-  void _onVoiceSignal(double rawNorm) {
-    _silenceTimer?.cancel();
-    _silenceTimer = null;
-    _isVoiceActive = true;
+  Float32List _convertPcm16ToFloat(Uint8List bytes) {
+    final sampleCount = bytes.length ~/ 2;
+    final data = ByteData.sublistView(bytes);
 
-    // Smooth exponential moving average for fluid animation
-    _smoothAmp = _smoothAmp * 0.3 + rawNorm * 0.7;
-    onVoiceStateChanged(AssistantState.listening, _smoothAmp);
+    final result = Float32List(sampleCount);
+
+    for (int i = 0; i < sampleCount; i++) {
+      result[i] =
+          data.getInt16(i * 2, Endian.little) / 32768.0;
+    }
+
+    return result;
   }
 
-  void _onSilenceSignal() {
-    if (!_isVoiceActive) return;
+  double _calculateRms(Float32List samples) {
+    double sumSquares = 0.0;
 
-    // Debounce silence by 500ms to allow natural speech pauses between words
-    _silenceTimer ??= Timer(const Duration(milliseconds: 500), () {
+    for (final sample in samples) {
+      sumSquares += sample * sample;
+    }
+
+    return sqrt(sumSquares / samples.length);
+  }
+
+  void _processVadFrame(Float32List frame) {
+    final vad = _vad;
+    if (vad == null) return;
+
+    vad.acceptWaveform(frame);
+
+    final detected = vad.isDetected();
+
+    if (detected) {
+      _isVoiceActive = true;
+
+      onVoiceStateChanged(
+        AssistantState.listening,
+        _smoothAmp,
+      );
+    } else if (_isVoiceActive) {
       _isVoiceActive = false;
       _smoothAmp = 0.0;
-      onVoiceStateChanged(AssistantState.idle, 0.0);
-      _silenceTimer = null;
-    });
+
+      onVoiceStateChanged(
+        AssistantState.idle,
+        0.0,
+      );
+    }
   }
 
   Future<void> stopListening() async {
-    _silenceTimer?.cancel();
-    _silenceTimer = null;
     await _streamSub?.cancel();
     _streamSub = null;
-    await _ampSub?.cancel();
-    _ampSub = null;
 
     if (_isListening) {
       try {
         await _recorder.stop();
       } catch (_) {}
+
       _isListening = false;
     }
+
+    _audioBuffer.clear();
+
     _isVoiceActive = false;
     _smoothAmp = 0.0;
+
+    _vad?.reset();
+
+    onVoiceStateChanged(
+      AssistantState.idle,
+      0.0,
+    );
   }
 
   Future<void> dispose() async {
     await stopListening();
+
+    _vad?.free();
+    _vad = null;
+
+    _isInitialized = false;
+
     await _recorder.dispose();
   }
 }
