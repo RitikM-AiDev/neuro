@@ -289,22 +289,6 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
         return;
       }
 
-      // Download or reuse the local Silero VAD model.
-      if (!_voiceService.isInitialized) {
-        final modelPath = await _modelManager.ensureVadModel(
-          onProgress: (progress) {
-            debugPrint(
-              'VAD model download: ${(progress * 100).toStringAsFixed(1)}%',
-            );
-          },
-        );
-
-        // Initialize Sherpa before starting the microphone.
-        await _voiceService.initialize(
-          vadModelPath: modelPath,
-        );
-      }
-
       if (!isActive) {
         await FlutterOverlayWindow.showOverlay(
           enableDrag: true,
@@ -325,11 +309,35 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
       }
 
       await _minimizeApp();
+
+      // Download or reuse the local Silero VAD model in background and initialize Sherpa.
+      if (!_voiceService.isInitialized) {
+        _initSherpaVad();
+      }
     } catch (e, stackTrace) {
       debugPrint('Neuro startup error: $e');
       debugPrintStack(stackTrace: stackTrace);
     } finally {
       _isStartingOverlay = false;
+    }
+  }
+
+  Future<void> _initSherpaVad() async {
+    try {
+      final modelPath = await _modelManager.ensureVadModel(
+        onProgress: (progress) {
+          debugPrint(
+            'VAD model download: ${(progress * 100).toStringAsFixed(1)}%',
+          );
+        },
+      );
+
+      await _voiceService.initialize(
+        vadModelPath: modelPath,
+      );
+      debugPrint('Sherpa Silero VAD initialized.');
+    } catch (e) {
+      debugPrint('Sherpa VAD background init: $e (using RMS audio fallback)');
     }
   }
 

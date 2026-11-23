@@ -73,10 +73,6 @@ class VoiceDetectorService {
   Future<void> startListening() async {
     if (_isListening) return;
 
-    if (!_isInitialized || _vad == null) {
-      throw StateError('VAD has not been initialized.');
-    }
-
     final permission = await _recorder.hasPermission();
 
     if (!permission) {
@@ -84,7 +80,7 @@ class VoiceDetectorService {
     }
 
     _audioBuffer.clear();
-    _vad!.reset();
+    _vad?.reset();
 
     final stream = await _recorder.startStream(
       const RecordConfig(
@@ -120,16 +116,35 @@ class VoiceDetectorService {
 
     _smoothAmp = _smoothAmp * 0.3 + rawAmplitude * 0.7;
 
-    _audioBuffer.addAll(samples);
+    final vad = _vad;
+    if (vad != null) {
+      _audioBuffer.addAll(samples);
 
-    while (_audioBuffer.length >= _frameSize) {
-      final frame = Float32List.fromList(
-        _audioBuffer.sublist(0, _frameSize),
-      );
+      while (_audioBuffer.length >= _frameSize) {
+        final frame = Float32List.fromList(
+          _audioBuffer.sublist(0, _frameSize),
+        );
 
-      _audioBuffer.removeRange(0, _frameSize);
+        _audioBuffer.removeRange(0, _frameSize);
 
-      _processVadFrame(frame);
+        _processVadFrame(frame);
+      }
+    } else {
+      // Immediate fallback to RMS voice reactivity until Sherpa VAD model is loaded
+      if (rms > 0.02) {
+        _isVoiceActive = true;
+        onVoiceStateChanged(
+          AssistantState.listening,
+          _smoothAmp,
+        );
+      } else if (_isVoiceActive) {
+        _isVoiceActive = false;
+        _smoothAmp = 0.0;
+        onVoiceStateChanged(
+          AssistantState.idle,
+          0.0,
+        );
+      }
     }
   }
 
