@@ -342,6 +342,7 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
         },
       );
 
+
       await _voiceService.initialize(
         vadModelPath: models.vadModelPath,
         sttModelPath: models.sttModelPath,
