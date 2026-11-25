@@ -1,4 +1,3 @@
-
 name: neuro_apps
 description: "Personal Assistant"
 publish_to: 'none'
@@ -19,17 +18,12 @@ dependencies:
   # Microphone audio capture
   record: ^7.2.0
 
-  # Model downloading
+  # HTTP client for Gemini API
   dio: ^5.11.1
 
-  # Private model storage
-  path_provider: ^2.1.6
+  # Environment variables (.env)
+  flutter_dotenv: ^6.0.0
 
-  # Model checksum verification
-  crypto: ^3.0.8
-  sherpa_onnx: 2.0.2
-
-  # Offline speech detection and recognition
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -39,4 +33,4 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/models/
+    - .env

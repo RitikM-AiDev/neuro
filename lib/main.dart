@@ -3,11 +3,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 
 import 'models/assistant_state.dart';
 import 'services/voice_detector_service.dart';
-import 'services/neuro_model_manager.dart';
 import 'widgets/neural_circle.dart';
 
 @pragma('vm:entry-point')
@@ -93,8 +93,13 @@ class _NeuralOverlayAppState extends State<NeuralOverlayApp> {
   }
 }
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await dotenv.load(fileName: '.env');
+  } catch (e) {
+    debugPrint('[Neuro] Failed to load .env: $e');
+  }
   runApp(const NeuroControllerApp());
 }
 
@@ -133,8 +138,6 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
 
   late final VoiceDetectorService _voiceService;
 
-  final NeuroModelManager _modelManager = NeuroModelManager();
-
   StreamSubscription? _overlaySubscription;
 
   Timer? _permissionPollTimer;
@@ -170,8 +173,8 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
           FlutterOverlayWindow.shareData('idle:0.0');
         }
       },
-      onSpeechRecognized: (text) {
-        debugPrint('[Neuro] Speech recognized: $text');
+      onResponseReceived: (text) {
+        debugPrint('[Neuro] Gemini Response: $text');
         FlutterOverlayWindow.shareData('speaking:0.8');
       },
     );
@@ -319,38 +322,11 @@ class _HeadlessLauncherState extends State<HeadlessLauncher>
       }
 
       await _minimizeApp();
-
-      // Download or reuse the local VAD & STT models in background and initialize Sherpa.
-      if (!_voiceService.isInitialized) {
-        _initSherpaModels();
-      }
     } catch (e, stackTrace) {
       debugPrint('Neuro startup error: $e');
       debugPrintStack(stackTrace: stackTrace);
     } finally {
       _isStartingOverlay = false;
-    }
-  }
-
-  Future<void> _initSherpaModels() async {
-    try {
-      final models = await _modelManager.ensureAllModels(
-        onProgress: (modelName, progress) {
-          debugPrint(
-            'Model [$modelName] download: ${(progress * 100).toStringAsFixed(1)}%',
-          );
-        },
-      );
-
-
-      await _voiceService.initialize(
-        vadModelPath: models.vadModelPath,
-        sttModelPath: models.sttModelPath,
-        sttTokensPath: models.sttTokensPath,
-      );
-      debugPrint('Sherpa Silero VAD + SenseVoice STT initialized.');
-    } catch (e) {
-      debugPrint('Sherpa models background init: $e (using RMS audio fallback)');
     }
   }
 
