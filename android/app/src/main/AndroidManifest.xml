@@ -12,11 +12,19 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- Haptic feedback vibration for drag-to-dismiss -->
     <uses-permission android:name="android.permission.VIBRATE"/>
+    <!-- Camera (flashlight), system write settings, and network/bluetooth state -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.WRITE_SETTINGS"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.BLUETOOTH"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
 
     <application
         android:label="neuro"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"
@@ -76,9 +84,10 @@
             </intent-filter>
         </service>
 
-        <!-- Power Button 3-sec Hold Accessibility Service -->
+        <!-- Unified Neuro Assistant Accessibility Service (Power Button + UI Automation) -->
         <service
-            android:name=".PowerButtonAccessibilityService"
+            android:name=".NeuroAccessibilityService"
+            android:label="Neuro Assistant"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>
@@ -86,7 +95,7 @@
             </intent-filter>
             <meta-data
                 android:name="android.accessibilityservice"
-                android:resource="@xml/power_button_accessibility" />
+                android:resource="@xml/neuro_accessibility_config" />
         </service>
 
         <!-- flutter_overlay_window service -->
@@ -105,6 +114,8 @@
     </application>
 
     <queries>
+        <package android:name="com.instagram.android"/>
+        <package android:name="com.flipkart.android"/>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

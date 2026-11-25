@@ -15,15 +15,12 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        controlChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.example.neuro_apps/control")
-        controlChannel?.setMethodCallHandler { call, result ->
-            if (call.method == "minimizeApp") {
-                moveTaskToBack(true)
-                result.success(true)
-            } else {
-                result.notImplemented()
-            }
-        }
+        controlChannel = SystemChannelBridge.register(
+            appContext = applicationContext,
+            messenger = flutterEngine.dartExecutor.binaryMessenger,
+            activityProvider = { this },
+        )
+        SystemChannelBridge.registerOverlayEngine(applicationContext)
     }
 
     override fun onNewIntent(intent: Intent) {
